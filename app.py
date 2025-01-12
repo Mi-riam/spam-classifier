@@ -1,98 +1,239 @@
+import streamlit as st
+from preprocessor import TextPreprocessor
+from model import SpamClassifier
+import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
-import re
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from nltk.stem import WordNetLemmatizer
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.model_selection import train_test_split
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-import streamlit as st
+from tqdm import tqdm
+import time
 
-# Pobierz dodatkowe zasoby NLTK
-nltk.download('punkt')
-nltk.download('wordnet')
-nltk.download('stopwords')
+def set_custom_style():
+    st.markdown("""
+        <style>
+    
+        </style>
+    """, unsafe_allow_html=True)
 
-# 1. Wczytanie danych z pliku CSV
-def load_data(file_path):
-    data = pd.read_csv(file_path, encoding='latin-1')
-    data = data.rename(columns={"v1": "label", "v2": "text"})
-    data = data[["label", "text"]]
-    data["label"] = data["label"].map({"spam": 1, "ham": 0})
-    return data
+@st.cache_resource
+def load_preprocessor():
+    return TextPreprocessor()
 
-# 2. Czyszczenie danych
-def clean_text(text):
-    text = text.lower()
-    text = re.sub(r'[^a-zA-Z]', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text
+@st.cache_resource
+def get_trained_classifier():
+    """Load data, prepare it, and train classifier once"""
+    preprocessor = load_preprocessor()
+    X_train, X_test, y_train, y_test = load_and_prepare_data()
+    classifier = SpamClassifier()
+    classifier.train(X_train, y_train)
+    return classifier, X_test, y_test
 
-# 3. Tokenizacja, lematyzacja, usuwanie słów stopowych
-def preprocess_text(text):
-    tokens = word_tokenize(text)
-    lemmatizer = WordNetLemmatizer()
-    stop_words = set(stopwords.words('english'))
-    processed_tokens = [lemmatizer.lemmatize(word) for word in tokens if word not in stop_words]
-    return ' '.join(processed_tokens)
+@st.cache_data
+def load_and_prepare_data():
+    # Create preprocessor inside the function
+    preprocessor = load_preprocessor()
+    df = preprocessor.load_data('spam_NLP.csv')
+    return preprocessor.prepare_data(df)
 
-# 4. Wektoryzacja
-def vectorize_text(data):
-    vectorizer = CountVectorizer()
-    X = vectorizer.fit_transform(data)
-    return X, vectorizer
+def classification_report_to_dict(report_text):
+    """Convert the classification report text to a dictionary"""
+    lines = report_text.split('\n')
+    metrics = {}
+    
+    for line in lines[2:-3]:  # Skip header and empty lines
+        if line.strip():
+            line_split = line.split()
+            if len(line_split) >= 4:  # Make sure we have all metrics
+                class_label = line_split[0]
+                metrics[class_label] = {
+                    'precision': float(line_split[1]),
+                    'recall': float(line_split[2]),
+                    'f1-score': float(line_split[3])
+                }
+    
+    # Get accuracy from the last line
+    accuracy_line = lines[-2]
+    if accuracy_line.strip():
+        metrics['accuracy'] = float(accuracy_line.split()[-1])
+    
+    return metrics
 
-# 5. Budowa modelu klasyfikacji
-def train_model(X, y):
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = MultinomialNB()
-    model.fit(X_train, y_train)
-    return model, X_test, y_test
+def classification_report_to_table(report_text):
+    """Convert the classification report text to a formatted DataFrame"""
+    lines = report_text.split('\n')
+    data = []
+    
+    # Skip header and get class data
+    for line in lines[2:]:  # Include all lines after header
+        if line.strip():
+            row = line.split()
+            
+            # Handle class-specific metrics (0 and 1)
+            if len(row) >= 5 and row[0] in ['0', '1']:
+                data.append({
+                    'Class': 'Spam' if row[0] == '1' else 'Not Spam',
+                    'Precision': float(row[1]),
+                    'Recall': float(row[2]),
+                    'F1-score': float(row[3]),
+                    'Support': int(row[4])
+                })
+            
+            # Handle accuracy
+            elif len(row) >= 3 and row[0] == 'accuracy':
+                data.append({
+                    'Class': 'Accuracy',
+                    'Precision': float(row[1]),
+                    'Recall': float(row[1]),
+                    'F1-score': float(row[1]),
+                    'Support': int(row[2])
+                })
+            
+            # Handle averages (micro, macro, weighted)
+            elif len(row) >= 6 and row[1] == 'avg':
+                avg_type = f"{row[0]} avg"
+                data.append({
+                    'Class': avg_type,
+                    'Precision': float(row[2]),
+                    'Recall': float(row[3]),
+                    'F1-score': float(row[4]),
+                    'Support': int(row[5])
+                })
+    
+    # Create DataFrame and sort rows in desired order
+    metrics_df = pd.DataFrame(data)
+    
+    # Define custom sort order
+    class_order = ['Spam', 'Not Spam', 'Accuracy', 'micro avg', 'macro avg', 'weighted avg']
+    metrics_df['sort_order'] = metrics_df['Class'].map({k: i for i, k in enumerate(class_order)})
+    metrics_df = metrics_df.sort_values('sort_order').drop('sort_order', axis=1)
+    
+    return metrics_df
 
-# 6. Ocena modelu
-def evaluate_model(model, X_test, y_test):
-    y_pred = model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-    precision = precision_score(y_test, y_pred)
-    recall = recall_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred)
-    cm = confusion_matrix(y_test, y_pred)
-    return accuracy, precision, recall, f1, cm
+def process_data():
+    # Stage 1: Data Loading
+    total_rows = sum(1 for _ in open('spam_NLP.csv'))
+    with tqdm(total=total_rows, desc="Loading Data") as pbar:
+        df = pd.read_csv('spam_NLP.csv', chunksize=1000)
+        for chunk in df:
+            # Process chunk
+            pbar.update(len(chunk))
+            
+    # Stage 2: Preprocessing
+    with tqdm(total=100, desc="Preprocessing", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
+        # Your preprocessing code here
+        preprocessed_data = preprocess_text(df['text'])
+        for i in range(100):
+            time.sleep(0.01)  # Simulate processing
+            pbar.update(1)
+            
+    # Stage 3: Model Training
+    with tqdm(total=100, desc="Training Model", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
+        # Your model training code here
+        model.fit(X_train, y_train)
+        for i in range(100):
+            time.sleep(0.01)  # Simulate training
+            pbar.update(1)
+            
+    return df, preprocessed_data, model
 
-# 7. Interfejs użytkownika Streamlit
+@st.cache_resource(show_spinner=False)
+def initialize_model():
+    """Initialize everything once at startup"""
+    progress = st.progress(0)
+    
+    # Stage 1: Data Preparation (25%)
+    preprocessor = load_preprocessor()
+    X_train, X_test, y_train, y_test = load_and_prepare_data()
+    progress.progress(25)
+    
+    # Stage 2: Model Training (50%)
+    classifier, X_test, y_test = get_trained_classifier()
+    progress.progress(75)
+    
+    # Stage 3: Model Evaluation (25%)
+    evaluation = classifier.evaluate(X_test, y_test)
+    progress.progress(100)
+    
+    # Keep the progress bar at 100%
+    st.success('Model Naive Bayes został zainicjalizowany i wytrenowany!')
+    
+    return preprocessor, classifier, evaluation
+
 def main():
-    st.title("Spam Classifier")
-    st.write("Wprowadź treść emaila, aby sprawdzić, czy jest to spam.")
+    set_custom_style()
+    st.title("Klasyfikator Wiadomości Spam")
+    
+    # Initialize everything once
+    preprocessor, classifier, evaluation = initialize_model()
+    
+    # Create single accordion for model evaluation
+    with st.expander("Ocena modelu", expanded=False):
+        # Create tabs for different metrics
+        tab1, tab2 = st.tabs(["Metryki Klasyfikacji", "Macierz Pomyłek"])
+        
+        # Metrics table tab
+        with tab1:
+            metrics_df = classification_report_to_table(evaluation['classification_report'])
+            
+            # Display the metrics table with custom styling
+            st.dataframe(
+                metrics_df,
+                column_config={
+                    "Class": "Klasa",
+                    "Precision": st.column_config.NumberColumn(
+                        "Precision",
+                        help="Precyzja klasyfikacji",
+                        format="%.3f"
+                    ),
+                    "Recall": st.column_config.NumberColumn(
+                        "Recall",
+                        help="Czułość klasyfikacji",
+                        format="%.3f"
+                    ),
+                    "F1-score": st.column_config.NumberColumn(
+                        "F1-score",
+                        help="Średnia harmoniczna precision i recall",
+                        format="%.3f"
+                    ),
+                    "Support": st.column_config.NumberColumn(
+                        "Support",
+                        help="Liczba próbek w zbiorze testowym",
+                        format="%d"
+                    )
+                },
+                hide_index=True,
+            )
 
-    # Wczytanie i przygotowanie danych
-    file_path = "spam_NLP.csv"
-    data = load_data(file_path)
-    data["text"] = data["text"].apply(clean_text)
-    data["text"] = data["text"].apply(preprocess_text)
+        # Confusion matrix tab
+        with tab2:
+            conf_matrix_fig = classifier.plot_confusion_matrix(evaluation['confusion_matrix'])
+            st.pyplot(conf_matrix_fig)
+            plt.close()
 
-    # Wektoryzacja i trenowanie modelu
-    X, vectorizer = vectorize_text(data["text"])
-    y = data["label"]
-    model, X_test, y_test = train_model(X, y)
-
-    # Ocena modelu
-    accuracy, precision, recall, f1, cm = evaluate_model(model, X_test, y_test)
-    st.write(f"Model trained with accuracy: {accuracy:.2f}, precision: {precision:.2f}, recall: {recall:.2f}, F1-score: {f1:.2f}")
-
-    # Pole do wprowadzenia tekstu przez użytkownika
-    user_input = st.text_area("Wprowadź tekst emaila")
-    if st.button("Analizuj"):
-        if user_input.strip():
-            cleaned_input = preprocess_text(clean_text(user_input))
-            input_vector = vectorizer.transform([cleaned_input])
-            prediction = model.predict(input_vector)
-            result = "Spam" if prediction[0] == 1 else "Nie-spam"
-            st.write(f"Wynik klasyfikacji: {result}")
-        else:
-            st.write("Proszę wprowadzić tekst emaila.")
+    # Message classification interface
+    st.header("Klasyfikuj Nową Wiadomość")
+    user_input = st.text_area("Wprowadź wiadomość do klasyfikacji:", height=300)
+    
+    if st.button("Klasyfikuj"):
+        try:
+            # Preprocess and transform the input
+            vectorized_input = preprocessor.transform_text(user_input)
+            
+            # Make prediction and get probability
+            prediction = classifier.predict(vectorized_input)
+            probabilities = classifier.predict_proba(vectorized_input)
+            confidence = probabilities[0][1] if prediction[0] == 1 else probabilities[0][0]
+            confidence_pct = confidence * 100
+            
+            # Display result with appropriate alert color
+            if prediction[0] == 1:
+                st.error(f"SPAM (pewność: {confidence_pct:.2f}%)")
+            else:
+                st.success(f"NIE SPAM (pewność: {confidence_pct:.2f}%)")
+                
+        except ValueError as e:
+            st.error("Błąd: Model musi być najpierw wytrenowany. Proszę odświeżyć stronę.")
+        except Exception as e:
+            st.error(f"Wystąpił błąd podczas klasyfikacji: {str(e)}")
 
 if __name__ == "__main__":
-    main()
+    main() 
